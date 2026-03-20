@@ -80,6 +80,11 @@ function parseClaimBody(body) {
   const date = contact.date || null;
   const company_name = (contact.company_name || '').trim() || null;
   const customer_id = (contact.customer_id || '').trim() || null;
+  const rawEmail = contact.customer_email;
+  const customer_email =
+    rawEmail != null && String(rawEmail).trim() !== ''
+      ? String(rawEmail).trim()
+      : null;
 
   const items = [];
   const seen = new Set();
@@ -107,7 +112,7 @@ function parseClaimBody(body) {
   }
   items.sort((a, b) => a.index - b.index);
 
-  return { date, company_name, customer_id, items };
+  return { date, company_name, customer_id, customer_email, items };
 }
 
 /**
@@ -116,7 +121,22 @@ function parseClaimBody(body) {
  * @param {Buffer} [attachment] - Optional file buffer (e.g. claim photo)
  * @param {string} [attachmentFilename] - Filename for the attachment
  */
-async function sendClaimEmail(claimId, date, company_name, customer_id, items, attachment, attachmentFilename) {
+function isPlausibleEmail(s) {
+  if (!s || typeof s !== 'string') return false;
+  const t = s.trim();
+  return t.length > 3 && t.includes('@') && !/\s/.test(t);
+}
+
+async function sendClaimEmail(
+  claimId,
+  date,
+  company_name,
+  customer_id,
+  customer_email,
+  items,
+  attachment,
+  attachmentFilename
+) {
   if (!resend || claimFormEmails.length === 0) return;
   const rows = items
     .map(
@@ -142,7 +162,8 @@ async function sendClaimEmail(claimId, date, company_name, customer_id, items, a
   <h2>New claim #${claimId}</h2>
   <p><strong>Date:</strong> ${escapeHtml(date)}<br>
   <strong>Company:</strong> ${escapeHtml(company_name)}<br>
-  <strong>Customer ID:</strong> ${escapeHtml(customer_id)}</p>
+  <strong>Customer ID:</strong> ${escapeHtml(customer_id)}<br>
+  <strong>Customer email:</strong> ${customer_email ? escapeHtml(customer_email) : '<em>(not provided)</em>'}</p>
   <h3>Items</h3>
   <table>
     <thead><tr>
@@ -152,7 +173,7 @@ async function sendClaimEmail(claimId, date, company_name, customer_id, items, a
   </table>
 </body>
 </html>`;
-  const text = `New claim #${claimId}\nDate: ${date}\nCompany: ${company_name}\nCustomer ID: ${customer_id}\n\nItems:\n${items
+  const text = `New claim #${claimId}\nDate: ${date}\nCompany: ${company_name}\nCustomer ID: ${customer_id}\nCustomer email: ${customer_email || '(not provided)'}\n\nItems:\n${items
     .map(
       (r, i) =>
         `${i + 1}. ${r.style_no} | ${r.description} | ${r.colour} | ${r.size} | ${r.reason} | Qty: ${r.quantity} | Order: ${r.order_number} | Batch: ${r.batch_number}`
@@ -160,13 +181,21 @@ async function sendClaimEmail(claimId, date, company_name, customer_id, items, a
     .join('\n')}`;
   const from = fromName ? `${fromName} <${fromEmail}>` : fromEmail;
   const payload = { from, to: claimFormEmails, subject: `Claim #${claimId} – ${company_name}`, html, text };
+  if (isPlausibleEmail(customer_email)) {
+    payload.replyTo = customer_email.trim();
+  }
   if (attachment && Buffer.isBuffer(attachment) && attachmentFilename) {
     payload.attachments = [{ filename: attachmentFilename, content: attachment }];
   }
   try {
-    await resend.emails.send(payload);
+    const { data, error } = await resend.emails.send(payload);
+    if (error) {
+      console.error('Resend error:', error.message || error, error);
+    } else {
+      console.log(`Claim email sent for #${claimId} to ${claimFormEmails.join(', ')} (id: ${data?.id || 'n/a'})`);
+    }
   } catch (err) {
-    console.error('Resend error:', err.message);
+    console.error('Resend error:', err.message, err);
   }
 }
 
@@ -190,7 +219,7 @@ app.post('/api/claims', (req, res, next) => {
   }
   next();
 }, async (req, res) => {
-  const { date, company_name, customer_id, items } = parseClaimBody(req.body);
+  const { date, company_name, customer_id, customer_email, items } = parseClaimBody(req.body);
 
   if (!date || !company_name || !customer_id) {
     return res.status(400).json({
@@ -246,7 +275,7 @@ app.post('/api/claims', (req, res, next) => {
   }
 
   // Send claim data to configured email via Resend (non-blocking for response), with optional photo attachment
-  sendClaimEmail(claimId, date, company_name, customer_id, items, attachment, attachmentFilename).catch((err) =>
+  sendClaimEmail(claimId, date, company_name, customer_id, customer_email, items, attachment, attachmentFilename).catch((err) =>
     console.error('Claim email error:', err)
   );
 
